@@ -1,16 +1,6 @@
-/*
- * build:
- *   cc -o server server.c -lrdmacm
- *
- * usage:
- *   server
- *
- * waits for client to connect, receives two integers, and sends their
- * sum back to the client.
- */
-
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <sys/time.h>
 #include <stdint.h>
 #include <arpa/inet.h>
@@ -19,10 +9,10 @@
 #include <rdma/rdma_cma.h>
 
 #define BUFSIZE (1<<30)
-#define DATASIZE (1<<28)
+#define DATASIZE (1<<29)
 
-#define ROW 80
-#define COLUMN 64
+#define ROW 24
+#define COLUMN 16 
 
 enum {
 	RESOLVE_TIMEOUT_MS	= 5000,
@@ -35,21 +25,18 @@ struct pdata {
 
 struct timeval time_start;
 
-void start() {
+void start_timer() {
         gettimeofday(&time_start,NULL);
 }
 
-void end_and_print() {
+void print_timer() {
         struct timeval time_end, res;
         gettimeofday(&time_end,NULL);
         timersub(&time_end,&time_start,&res);
 
         long long d = (time_end.tv_sec - time_start.tv_sec) * 1000000L + time_end.tv_usec - time_start.tv_usec;
         double dd = d;
-        //printf("start %u.%u s\n", time_start.tv_sec, time_start.tv_usec);
-        //printf("end %u.%u s\n", time_end.tv_sec, time_end.tv_usec);
-        //printf("%u.%u s \n",res.tv_sec,res.tv_usec);
-        printf("%.3lf s \n",dd / 1000000);
+       printf("%.3lf s \n",dd / 1000000);
 
 }
 
@@ -89,7 +76,6 @@ int main(int argc, char *argv[])
 	recv_buf = malloc(BUFSIZE * sizeof(char));
 	send_buf = malloc(BUFSIZE * sizeof(char));
 	if (recv_buf == NULL || send_buf == NULL) return 1;
-	printf("%p %p\n", recv_buf, send_buf);
 
 	/* Set up RDMA CM structures */
 
@@ -140,7 +126,7 @@ int main(int argc, char *argv[])
 	if (!comp_chan)
 		return 1;
 
-	cq = ibv_create_cq(cm_id->verbs, 2, NULL, comp_chan, 0);
+	cq = ibv_create_cq(cm_id->verbs, 10, NULL, comp_chan, 0);
 	if (!cq)
 		return 1;
 
@@ -164,10 +150,10 @@ int main(int argc, char *argv[])
 			return 1;
 	}
 
-	qp_attr.cap.max_send_wr	 = 1;
-	qp_attr.cap.max_send_sge = 1;
-	qp_attr.cap.max_recv_wr	 = 1;
-	qp_attr.cap.max_recv_sge = 1;
+	qp_attr.cap.max_send_wr	 = 10;
+	qp_attr.cap.max_send_sge = 10;
+	qp_attr.cap.max_recv_wr	 = 10;
+	qp_attr.cap.max_recv_sge = 10;
 
 	qp_attr.send_cq		 = cq;
 	qp_attr.recv_cq		 = cq;
@@ -228,6 +214,9 @@ int main(int argc, char *argv[])
 		if (wc.status != IBV_WC_SUCCESS)
 			return 1;
 
+		ibv_ack_cq_events(cq, 1);
+
+		// post another receive
 		sge.addr   = recv_buf;
 		sge.length = BUFSIZE;
 		sge.lkey   = recv_mr->lkey;
@@ -238,19 +227,31 @@ int main(int argc, char *argv[])
 		if (ibv_post_recv(cm_id->qp, &recv_wr, &bad_recv_wr))
 			return 1;
 
-		/* Add two integers and send reply back */
+		//encode
 
-		puts("encode");
-		
-		printf("%d %d %d %d\n", DATASIZE, sizeof(recv_buf), sizeof(send_buf), get_nprocs());
-		start();
+		printf("encode : %d %d %d %d\n", DATASIZE, sizeof(recv_buf), sizeof(send_buf), get_nprocs());
+		start_timer();
 		out = (char**)malloc(ROW * sizeof(char*));
 		for (i = 0; i < ROW; i++)
 			out[i] = send_buf + i * (DATASIZE / COLUMN);
 		ec_method_batch_parallel_encode(DATASIZE, COLUMN, ROW, recv_buf, out, get_nprocs());
-		//ec_method_batch_encode(DATASIZE, 16, 24, recv_buf, send_buf);
 		free(out);
-		end_and_print();
+		print_timer();
+
+		//wait client's signal to send data back
+
+		if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
+			return 1;
+
+		if (ibv_req_notify_cq(cq, 0))
+			return 1;
+
+		if (ibv_poll_cq(cq, 1, &wc) < 1)
+			return 1;
+
+		ibv_ack_cq_events(cq, 1);
+	
+		// send data back to client
 
 		sge.addr   = send_buf;
 		sge.length = DATASIZE / COLUMN * ROW;
@@ -272,11 +273,23 @@ int main(int argc, char *argv[])
 		if (ibv_poll_cq(cq, 1, &wc) < 1)
 			return 1;
 
-		if (wc.status != IBV_WC_SUCCESS)
+		if (wc.status != IBV_WC_SUCCESS) 
 			return 1; 
-		ibv_ack_cq_events(cq, 2);
+
+		ibv_ack_cq_events(cq, 1);
 		ibv_req_notify_cq(cq, 0);
 
+		// post another receive for next round
+
+		sge.addr   = recv_buf;
+		sge.length = BUFSIZE;
+		sge.lkey   = recv_mr->lkey;
+
+		recv_wr.sg_list = &sge;
+		recv_wr.num_sge = 1;
+
+		if (ibv_post_recv(cm_id->qp, &recv_wr, &bad_recv_wr))
+			return 1;
 	}
 
 	return 0;

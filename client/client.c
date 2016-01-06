@@ -1,14 +1,3 @@
-/*
- * build:
- *   cc -o client client.c -lrdmacm
- *
- * usage:
- *   client <servername> <val1> <val2>
- *
- * connects to server, sends val1 via RDMA write and val2 via send,
- * and receives val1+val2 back from the server.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -24,10 +13,14 @@
 #include <rdma/rdma_cma.h>
 
 #define DATASIZE (1 << 30)
-#define COLUMN 64 
-#define ROW 80
-#define SERVER 4
+// COLUMN and ROW decides the disperse config
+#define COLUMN 16 
+#define ROW 24 
+// SERVER indicates the number of servers
+#define SERVER 2
+// bytes send to per server
 #define SENDSIZE (DATASIZE / SERVER)
+// bytes received from per server
 #define RECVSIZE (DATASIZE / SERVER / COLUMN * ROW)
 
 enum {
@@ -36,20 +29,17 @@ enum {
 
 struct timeval time_start;
 
-void start() {
+void start_timer() {
         gettimeofday(&time_start,NULL);
 }
 
-void end_and_print() {
+void print_timer() {
         struct timeval time_end, res;
         gettimeofday(&time_end,NULL);
         timersub(&time_end,&time_start,&res);
 
         long long d = (time_end.tv_sec - time_start.tv_sec) * 1000000L + time_end.tv_usec - time_start.tv_usec;
         double dd = d;
-        //printf("start %u.%u s\n", time_start.tv_sec, time_start.tv_usec);
-        //printf("end %u.%u s\n", time_end.tv_sec, time_end.tv_usec);
-        //printf("%u.%u s \n",res.tv_sec,res.tv_usec);
         printf("%.3lf s \n",dd / 1000000);
 
 }
@@ -60,6 +50,7 @@ struct pdata {
 };
 
 struct RdmaConn {
+	//maintain infomation of a connection to a particular server
 	struct rdma_event_channel      *cm_channel;
 	struct rdma_cm_id	       *cm_id;
 	struct ibv_pd		       *pd;
@@ -74,6 +65,9 @@ struct RdmaConn {
 
 struct RdmaConn* my_connect(const char* server)
 {
+	//connect to a particular server
+	//if succeed, return pointer to a struct RdmaConn
+	//otherwise return NULL
 	struct pdata			server_pdata;
 
 	struct rdma_event_channel      *cm_channel;
@@ -158,12 +152,14 @@ struct RdmaConn* my_connect(const char* server)
 	if (!comp_chan)
 		return NULL;
 
-	cq = ibv_create_cq(cm_id->verbs, 2, NULL, comp_chan, 0);
+	cq = ibv_create_cq(cm_id->verbs, 10, NULL, comp_chan, 0);
 	if (!cq)
 		return NULL;
 
 	if (ibv_req_notify_cq(cq, 0))
 		return NULL;
+
+	/* register memory */
 
 	send_buf = (char*) malloc(SENDSIZE);
 	recv_buf = (char*) malloc(RECVSIZE);
@@ -181,9 +177,11 @@ struct RdmaConn* my_connect(const char* server)
 	if (!send_mr)
 		return NULL;
 
-	qp_attr.cap.max_send_wr	 = 2;
+	/* create queue pair */
+
+	qp_attr.cap.max_send_wr	 = 10;
 	qp_attr.cap.max_send_sge = 1;
-	qp_attr.cap.max_recv_wr	 = 1;
+	qp_attr.cap.max_recv_wr	 = 10;
 	qp_attr.cap.max_recv_sge = 1;
 
 	qp_attr.send_cq		 = cq;
@@ -230,8 +228,11 @@ struct RdmaConn* my_connect(const char* server)
 	return rdma_conn;
 }
 
-int work(struct RdmaConn *conn)
+int my_send(struct RdmaConn *conn)
 {
+	//send data to server
+	//if succeed return 0
+	//otherwise return 1
 	struct ibv_sge			sge;
 	struct ibv_send_wr		send_wr = { };
 	struct ibv_send_wr	       *bad_send_wr;
@@ -269,10 +270,78 @@ int work(struct RdmaConn *conn)
 	if (ibv_post_recv(cm_id->qp, &recv_wr, &bad_recv_wr))
 		return 1;
 
-	/* Write/send two integers to be added */
+	/* send data to the server */
 
 	sge.addr   = send_buf;
 	sge.length = SENDSIZE;
+	sge.lkey   = send_mr->lkey;
+
+	send_wr.wr_id		    = 1;
+	send_wr.opcode		    = IBV_WR_SEND;
+	send_wr.send_flags	    = IBV_SEND_SIGNALED;
+	send_wr.sg_list		    = &sge;
+	send_wr.num_sge		    = 1;
+	send_wr.wr.rdma.rkey	    = ntohl(server_pdata.buf_rkey);
+	send_wr.wr.rdma.remote_addr = ntohll(server_pdata.buf_va);
+
+	if (ibv_post_send(cm_id->qp, &send_wr, &bad_send_wr))
+		return 1;
+
+	/* Wait for send completion */
+
+	if (ibv_get_cq_event(comp_chan, &evt_cq, &cq_context))
+		return 1;
+
+	if (ibv_poll_cq(cq, 1, &wc) < 1)
+		return 1;
+
+	if (wc.status != IBV_WC_SUCCESS)
+		return 1;
+
+	ibv_ack_cq_events(cq, 1);
+
+	if (ibv_req_notify_cq(cq, 0)) 
+		return 1;
+
+	return 0;
+
+}
+
+int my_recv(struct RdmaConn *conn)
+{
+	// gather data from the server
+	//if succeed return 0
+	//otherwise return 1
+	struct ibv_sge			sge;
+	struct ibv_send_wr		send_wr = { };
+	struct ibv_send_wr	       *bad_send_wr;
+	struct ibv_recv_wr		recv_wr = { };
+	struct ibv_recv_wr	       *bad_recv_wr;
+	struct ibv_wc			wc;
+	void			       *cq_context;
+	struct ibv_cq			*evt_cq;
+
+	int				err;
+	int 				n;
+
+	struct rdma_event_channel      *cm_channel = conn->cm_channel;
+	struct rdma_cm_id	       *cm_id = conn->cm_id;
+	struct ibv_pd		       *pd = conn->pd;
+	struct ibv_comp_channel	       *comp_chan = conn->comp_chan;
+	struct ibv_cq		       *cq = conn->cq;
+	struct ibv_mr		       *recv_mr = conn->recv_mr;
+	struct ibv_mr		       *send_mr = conn->send_mr;
+	char				*recv_buf = conn->recv_buf;
+	char 				*send_buf = conn->send_buf;	
+	struct pdata			server_pdata;
+	memcpy(&server_pdata, &conn->server_pdata, sizeof(struct pdata));
+
+
+	/* send one byte to the server to inform it send data back */
+	/* TODO: using a rdma read would make the code more clear */
+
+	sge.addr   = send_buf;
+	sge.length = 1;
 	sge.lkey   = send_mr->lkey;
 
 	send_wr.wr_id		    = 1;
@@ -313,7 +382,7 @@ int work(struct RdmaConn *conn)
 
 void* pwork(void *param)
 {
-	work((struct RdmaConn*) param);
+        my_recv((struct RdmaConn*) param);
 }
 
 int main(int argc, char *argv[])
@@ -326,23 +395,28 @@ int main(int argc, char *argv[])
 	strcpy(servers[1], "10.0.0.7");
 	strcpy(servers[2], "10.0.0.8");
 	strcpy(servers[3], "10.0.0.9");
+	
+	// create connection to each server
 	for (i = 0; i < SERVER; i++) {
 		conns[i] = my_connect(servers[i]);
 	}
-	if (argc > 1 && 0 == strcmp(argv[1], "p")) {
-		// parallel execution
-		start();
-		threads = malloc(sizeof(pthread_t)*SERVER);
-		for (i = 0; i < SERVER; i++) {
-			pthread_create(threads+i, NULL, pwork, (void *)(conns[i]));
-		}
-		for (i = 0; i < SERVER; i++)
-			pthread_join(threads[i], NULL);
-		free(threads);
-		end_and_print();
-	} else {
-		//pipe line execution
-		
+
+	start_timer();
+
+	// send data one by one
+	for (i = 0; i < SERVER; i++) {
+		printf("%d send : %d\n", i, my_send(conns[i]));
 	}
+
+	// concurrently gather data from servers
+        threads = malloc(sizeof(pthread_t)*SERVER);
+	for (i = 0; i < SERVER; i++) {
+		pthread_create(threads+i, NULL, pwork, (void *)(conns[i]));
+	}
+	for (i = 0; i < SERVER; i++)
+		pthread_join(threads[i], NULL);
+	free(threads);
+
+	print_timer();
 	return 0;
 }
